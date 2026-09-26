@@ -8,6 +8,7 @@ import (
 
 	"encoding/json"
 	"github.com/voocel/agentcore"
+	"github.com/voocel/ainovel-cli/internal/bootstrap"
 	"log/slog"
 )
 
@@ -93,7 +94,10 @@ func (o *observer) handleContextProgress(ev agentcore.Event) {
 	if payload.Percent > 85 {
 		level = "warn"
 	}
-	summary := fmt.Sprintf("%s 上下文 %.0f%% (%d/%d) 策略: %s", agent, payload.Percent, payload.Tokens, payload.ContextWindow, payload.Strategy)
+	// 分母是名义窗口，压缩实际在阈值（window*CompactRatio）触发，顺带展示阈值
+	// 避免“85% 没到就压了”的误读（如 195k/200k：阈值实为 170k，已超）。
+	threshold := payload.ContextWindow - bootstrap.CompactReserveTokens(payload.ContextWindow)
+	summary := fmt.Sprintf("%s 上下文 %.0f%% (%d/%d,限%d) 策略: %s", agent, payload.Percent, payload.Tokens, payload.ContextWindow, threshold, payload.Strategy)
 
 	if payload.Strategy != "" {
 		// 触发了压缩 → 事件流 + 日志

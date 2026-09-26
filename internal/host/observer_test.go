@@ -26,6 +26,32 @@ func testObserver(events *[]Event) *observer {
 	}
 }
 
+// 上下文事件行必须带压缩阈值（window*CompactRatio），避免“85% 没到就压了”误读
+// （如 195665/200000：阈值=200000*0.85=170000，已超，压缩是预期行为）。
+func TestObserverContextEventShowsThreshold(t *testing.T) {
+	var events []Event
+	o := testObserver(&events)
+
+	o.handleContextProgress(agentcore.Event{
+		Progress: &agentcore.ProgressPayload{
+			Agent: "writer",
+			Meta: json.RawMessage(`{"tokens":195665,"context_window":200000,"percent":97.8,"strategy":"tool_result_microcompact"}`),
+		},
+	})
+	if len(events) != 1 {
+		t.Fatalf("压缩事件应发 1 条，got %d", len(events))
+	}
+	// 200000 - CompactReserveTokens(200000) = 170000
+	expected := "writer 上下文 98% (195665/200000,限170000) 策略: tool_result_microcompact"
+	if events[0].Summary != expected {
+		t.Fatalf("got %q, want %q", events[0].Summary, expected)
+	}
+	// 快照同步同样更新
+	if got := o.agents["writer"].context.Tokens; got != 195665 {
+		t.Fatalf("snapshot tokens = %d", got)
+	}
+}
+
 func TestObserverSubagentRetryEventsUpdateSameLinePerAgent(t *testing.T) {
 	var events []Event
 	o := testObserver(&events)

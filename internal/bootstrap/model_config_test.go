@@ -147,6 +147,50 @@ func TestResolveContextWindowIsProviderAware(t *testing.T) {
 	}
 }
 
+// 回归：SwappableModel.Info().Provider 会返回底层协议的 provider 名（如
+// "openai"），不是 config provider key（如 "CPA-SWE2"）。ContextManagerFactory
+// 用 ModelProvider(model)+ModelName(model) 调 ResolveContextWindow，若走
+// Info() 路径查 Providers map 会 miss，落到 DefaultContextWindow=200000，
+// 导致已配置 context_window=350000 的模型仍在 200k 处触发压缩。
+// 修复：ModelProvider 优先走 ProviderName() 接口（SwappableModel 返 config key）。
+func TestModelProviderReturnsConfigKeyNotProtocolName(t *testing.T) {
+	cfg := Config{
+		Provider:  "CPA-SWE2",
+		ModelName: "swe-2",
+		Providers: map[string]ProviderConfig{
+			"CPA-SWE2": {
+				Type:    "openai",
+				API:     "chat",
+				APIKey:  "x",
+				BaseURL: "https://x/v1",
+				Models: []ModelConfig{
+					{Name: "swe-2", ContextWindow: 350000},
+				},
+			},
+		},
+	}
+	cfg.FillDefaults()
+
+	ms, err := NewModelSet(cfg)
+	if err != nil {
+		t.Fatalf("NewModelSet: %v", err)
+	}
+
+	// writer 未配置 role，走 default；与 build.go 一致走 ForRoleWithFailover。
+	m := ms.ForRoleWithFailover("writer", nil)
+	if got := ModelProvider(m); got != "CPA-SWE2" {
+		t.Fatalf("ModelProvider should return config key, got %q", got)
+	}
+	if got := ModelName(m); got != "swe-2" {
+		t.Fatalf("ModelName = %q", got)
+	}
+
+	w, src := ms.ResolveContextWindow(ModelProvider(m), ModelName(m))
+	if w != 350000 || src != CtxWindowModelConfig {
+		t.Fatalf("expected window=350000 source=model_config, got %d %s", w, src)
+	}
+}
+
 func TestSaveProviderConfigPreservesSelectionAndUsesPrivateMode(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".ainovel", "config.json")
 	original := Config{
