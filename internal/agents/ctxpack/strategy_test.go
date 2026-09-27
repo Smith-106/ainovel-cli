@@ -97,6 +97,30 @@ func TestWriterRestorePackRefreshReusesStoreBuilder(t *testing.T) {
 	}
 }
 
+// 回归：压缩成功但剩余空间不足（room=0）时，Hook 必须降级跳过注入而非报错——
+// 否则整个压缩结果被丢弃、整轮 project context 失败（线上：requires 8451 tokens, only 0 available）。
+func TestWriterRestoreHookSkipsWhenRoomInsufficient(t *testing.T) {
+	s := seededWriterStore(t)
+	pack := &WriterRestorePack{}
+	pack.Refresh(s)
+
+	hook := pack.Hook()
+	out, err := hook(context.Background(), corecontext.SummaryInfo{}, nil, 0)
+	if err != nil {
+		t.Fatalf("room=0 时 Hook 应跳过而非报错，got: %v", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("room=0 时应无注入，got %d 条", len(out))
+	}
+
+	// 空 pack 同样跳过
+	empty := &WriterRestorePack{}
+	out, err = empty.Hook()(context.Background(), corecontext.SummaryInfo{}, nil, 6000)
+	if err != nil || len(out) != 0 {
+		t.Fatalf("空 pack 应跳过，got out=%d err=%v", len(out), err)
+	}
+}
+
 func seededWriterStore(t *testing.T) *storepkg.Store {
 	t.Helper()
 

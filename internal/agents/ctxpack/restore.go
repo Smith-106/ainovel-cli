@@ -3,6 +3,7 @@ package ctxpack
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 
 	"github.com/voocel/agentcore"
@@ -173,10 +174,17 @@ func (p *WriterRestorePack) Clear() {
 
 // Hook returns a PostSummaryHook that injects the cached restore pack.
 // The hook performs no I/O — it only reads the in-memory pack under a read lock.
+//
+// 空间不足（room < pack 大小）时降级为跳过注入而非报错：压缩本身已成功，
+// 为塞不下恢复包而丢弃整个压缩结果是本末倒置（曾导致整轮 project context 失败）。
 func (p *WriterRestorePack) Hook() corecontext.PostSummaryHook {
 	return func(_ context.Context, _ corecontext.SummaryInfo, _ []agentcore.AgentMessage, room int) ([]agentcore.AgentMessage, error) {
 		msg, ok, err := p.buildMessage(min(restoreBudgetTokens, room))
 		if err != nil {
+			if _, isBudget := err.(*restoreBudgetError); isBudget {
+				slog.Warn("恢复包超出压缩剩余空间，跳过注入", "module", "context", "room", room, "err", err)
+				return nil, nil
+			}
 			return nil, err
 		}
 		if !ok {
@@ -184,6 +192,16 @@ func (p *WriterRestorePack) Hook() corecontext.PostSummaryHook {
 		}
 		return []agentcore.AgentMessage{msg}, nil
 	}
+}
+
+// restoreBudgetError 表示恢复包超出可用空间（可降级跳过），区别于不可恢复的构造错误。
+type restoreBudgetError struct {
+	required int
+	budget   int
+}
+
+func (e *restoreBudgetError) Error() string {
+	return fmt.Sprintf("writer restore pack requires %d tokens, only %d available", e.required, e.budget)
 }
 
 // buildMessage returns the cached restore message when it fits.
@@ -197,7 +215,7 @@ func (p *WriterRestorePack) buildMessage(budgetTokens int) (agentcore.Message, b
 	msg := agentcore.UserMsg(p.text)
 	required := corecontext.EstimateTokens(msg)
 	if required > budgetTokens {
-		return agentcore.Message{}, false, fmt.Errorf("writer restore pack requires %d tokens, only %d available", required, budgetTokens)
+		return agentcore.Message{}, false, &restoreBudgetError{required: required, budget: budgetTokens}
 	}
 	return msg, true, nil
 }
