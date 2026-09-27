@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/voocel/agentcore"
 	"github.com/voocel/ainovel-cli/internal/bootstrap"
 )
 
@@ -43,6 +44,8 @@ func newModelConfigTestHost(t *testing.T) (*Host, string) {
 // 推理强度存储保留原始意图：显式设定后，切模型不得把它钳制降级写回。
 func TestSetRoleThinkingPreservesIntentAcrossModelSwitch(t *testing.T) {
 	h, _ := newModelConfigTestHost(t)
+	// 该测试只验 thinking 意图保留：短路 SwitchModel 冒烟（proxy 指向 example.com）。
+	h.models.SetSmokeTestForTest(func(agentcore.ChatModel) error { return nil })
 	if err := h.SetRoleThinking("writer", "high"); err != nil {
 		t.Fatalf("set thinking: %v", err)
 	}

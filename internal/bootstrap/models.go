@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/llm"
@@ -133,6 +134,9 @@ type ModelSet struct {
 	models    map[string]*SwappableModel
 	fallbacks map[string][]modelTarget
 	config    Config
+	// smokeTest 覆盖 Swap 前的连通性冒烟；nil 用默认 smokeTestModel。
+	// 测试经 SetSmokeTestForTest 注入短路，避免对外发真请求。
+	smokeTest func(agentcore.ChatModel) error
 }
 
 // ForRole 返回指定角色的模型，未配置时返回默认模型。
@@ -209,6 +213,17 @@ func (ms *ModelSet) Swap(role, provider, model string) error {
 	next, err := createModelFromConfig(provider, model, pc, make(map[string]agentcore.ChatModel))
 	if err != nil {
 		return fmt.Errorf("切换模型失败: %w", err)
+	}
+	// 连通性冒烟：曾出现用户切到代理端拒绝站外调用的免费模型
+	// （OpenCode's free tier can only be used from within OpenCode [auth, HTTP 403]）
+	// 后 40 秒 arbiter 才挂。切换时发一个最小请求，失败则当场拦截、保留原模型。
+	smoke := ms.smokeTest
+	// 注意：Swap 调用时已持有写锁，直接读字段不另加锁。
+	if smoke == nil {
+		smoke = smokeTestModel
+	}
+	if err := smoke(next); err != nil {
+		return fmt.Errorf("模型 %s/%s 连通性检查失败（已保留原模型）: %w", provider, model, err)
 	}
 
 	jsonSchema := ms.config.ModelJSONSchema(provider, model)
@@ -361,6 +376,26 @@ func NewModelSet(cfg Config) (*ModelSet, error) {
 }
 
 // createModelFromConfig 创建或复用 ChatModel 实例。
+// SetSmokeTestForTest 仅供测试注入冒烟短路。
+func (ms *ModelSet) SetSmokeTestForTest(fn func(agentcore.ChatModel) error) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	ms.smokeTest = fn
+}
+
+// smokeTestModel 向新模型发一个最小请求做连通性检查。超时 90s（单次 Generate
+// 无重试，403 类拒绝通常秒级返回）。失败则调用方保留原模型。
+func smokeTestModel(model agentcore.ChatModel) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	_, err := model.Generate(ctx,
+		[]agentcore.Message{agentcore.UserMsg("hi")},
+		nil,
+		agentcore.WithMaxTokens(1),
+	)
+	return err
+}
+
 func createModelFromConfig(providerKey, model string, pc ProviderConfig, cache map[string]agentcore.ChatModel) (agentcore.ChatModel, error) {
 	cacheKey := providerKey + "|" + model
 	if m, ok := cache[cacheKey]; ok {

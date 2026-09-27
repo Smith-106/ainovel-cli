@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/voocel/agentcore"
 )
 
 func TestModelConfigAcceptsLegacyAndObjectEntries(t *testing.T) {
@@ -103,6 +105,8 @@ func TestSwappableModelJSONSchemaOverrideFollowsSwap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new model set: %v", err)
 	}
+	// 该测试只验 json_schema 跟随切换：短路 Swap 冒烟，避免对外发真请求。
+	ms.smokeTest = func(agentcore.ChatModel) error { return nil }
 	if v := ms.Default.JSONSchemaOverride(); v == nil || !*v {
 		t.Fatalf("初始应为 true, got %v", v)
 	}
