@@ -25,7 +25,9 @@ func newContextManager(cfg contextManagerConfig) *corecontext.ContextEngine {
 	if cfg.Summary != nil {
 		sc = *cfg.Summary
 	}
-	sc.Model = cfg.Model
+	// 摘要路径经 wrapSummaryModel 剥离 ThinkingOff：agentcore standalone 摘要硬编码
+	// off，而 litellm openai provider 对非推理模型显式 off 本地报错，致每次压缩必挂。
+	sc.Model = wrapSummaryModel(cfg.Model)
 
 	var tc corecontext.ToolResultMicrocompactConfig
 	if cfg.ToolMicrocompact != nil {

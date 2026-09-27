@@ -63,3 +63,44 @@ func TestRoleContextManagerSummarizesToolLoop(t *testing.T) {
 		t.Fatal("the newest read_chapter evidence must stay verbatim in the kept suffix")
 	}
 }
+
+// 记录 resolve 后 ThinkingLevel 的桩，用于断言摘要路径的 thinking 处理。
+type thinkingCaptureModel struct {
+	stubSummaryModel
+levels []agentcore.ThinkingLevel
+}
+
+func (m *thinkingCaptureModel) Generate(ctx context.Context, msgs []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
+m.levels = append(m.levels, agentcore.ResolveCallConfig(opts).ThinkingLevel)
+return m.stubSummaryModel.Generate(ctx, msgs, tools, opts...)
+}
+
+// 回归：摘要路径硬编码的 ThinkingOff 必须被剥离为 unset——litellm openai provider
+// 对非推理模型遇显式 off 本地报错 "openai: thinking is only supported for
+// reasoning chat models"，致每次压缩必挂（compaction turn prefix）。
+func TestSummaryModelStripsThinkingOff(t *testing.T) {
+inner := &thinkingCaptureModel{}
+wrapped := wrapSummaryModel(inner)
+if _, ok := wrapped.(*summaryModel); !ok {
+	t.Fatal("expected *summaryModel")
+}
+if _, err := wrapped.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil, agentcore.WithThinking(agentcore.ThinkingOff)); err != nil {
+	t.Fatal(err)
+}
+if len(inner.levels) != 1 {
+	t.Fatalf("expected 1 inner call, got %d", len(inner.levels))
+}
+if inner.levels[0] != "" {
+	t.Fatalf("ThinkingOff 应被剥离为 unset，got %q", inner.levels[0])
+}
+// 非 off 值透传不受影响
+if _, err := wrapped.Generate(context.Background(), []agentcore.Message{agentcore.UserMsg("hi")}, nil, agentcore.WithThinking(agentcore.ThinkingLow)); err != nil {
+	t.Fatal(err)
+}
+if inner.levels[1] != agentcore.ThinkingLow {
+	t.Fatalf("非 off 值应透传，got %q", inner.levels[1])
+}
+if wrapSummaryModel(nil) != nil {
+	t.Fatal("nil 模型应保持 nil")
+}
+}
