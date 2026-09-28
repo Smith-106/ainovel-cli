@@ -383,8 +383,16 @@ func (ms *ModelSet) SetSmokeTestForTest(fn func(agentcore.ChatModel) error) {
 	ms.smokeTest = fn
 }
 
-// smokeTestModel 向新模型发一个最小请求做连通性检查。超时 90s（单次 Generate
-// 无重试，403 类拒绝通常秒级返回）。失败则调用方保留原模型。
+// smokeTestModel 向新模型发一个最小非流式请求做连通性检查。超时 90s（单次
+// Generate 无重试，403 类拒绝通常秒级返回）。失败则调用方保留原模型。
+//
+// 形状必须保持最小且不带 thinking：ainovel 经 litellm-go 的 openai provider
+// 出站（provider/openai/request.go），非推理模型遇到显式 thinking（含
+// ThinkingMax/ThinkingOff）在本地直接报错，请求发不出去——冒烟若带上
+// thinking，所有走 openai 协议的代理模型（CPA-* 等）会被稳定误杀。网关侧对
+// 上游免费池的路由差异无法经 Thinking API 复制，保持 thinking-free 的
+// Generate 才是冒烟的正确形状；真实调用的偶发 403/503 由 llmretry 与
+// failoverModel 承担，不在冒烟里解决。
 func smokeTestModel(model agentcore.ChatModel) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
