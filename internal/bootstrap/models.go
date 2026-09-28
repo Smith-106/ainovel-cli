@@ -108,6 +108,59 @@ func (m *SwappableModel) Swap(provider, name string, model agentcore.ChatModel, 
 	m.jsonSchema = jsonSchema
 }
 
+// Generate 优先走流式组装，失败再回落非流式——与 agentcore 主循环
+// （callLLM → callLLMStream）及 failoverModel.startAttempt 同策略。
+//
+// 背景：部分聚合网关对免费池按请求形态路由——非流式 chat completions 走
+// 上游拒绝站外调用的池（403 OpenCode free tier），而流式（尤其带 thinking
+// 时）走健康池。直调 adapter.Generate 的调用方（arbiter/imp/sim 等经
+// llmcontract.Execute）会被稳定 403，而 worker（流式）正常。流式优先让
+// 所有直接调用方与主循环同形态；健康 provider 下流式 Done 组装与非流式
+// 等价（同 usage/stopReason 映射），回落保证流式不支持的端点行为不变。
+func (m *SwappableModel) Generate(ctx context.Context, msgs []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
+	m.mu.RLock()
+	current := m.SwappableModel.Current()
+	m.mu.RUnlock()
+	if streamer, ok := current.(interface {
+		GenerateStream(context.Context, []agentcore.Message, []agentcore.ToolSpec, ...agentcore.CallOption) (<-chan agentcore.StreamEvent, error)
+	}); ok {
+		if resp, err := assembleStream(ctx, streamer, msgs, tools, opts...); err == nil {
+			return resp, nil
+		}
+	}
+	return m.SwappableModel.Generate(ctx, msgs, tools, opts...)
+}
+
+// assembleStream 消费流式事件，以 Done 事件的终态 Message 组装响应。
+// 流初始化失败、Error 事件、中途断流一律返回错误，由调用方回落非流式。
+func assembleStream(ctx context.Context, streamer interface {
+	GenerateStream(context.Context, []agentcore.Message, []agentcore.ToolSpec, ...agentcore.CallOption) (<-chan agentcore.StreamEvent, error)
+}, msgs []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (*agentcore.LLMResponse, error) {
+	ch, err := streamer.GenerateStream(ctx, msgs, tools, opts...)
+	if err != nil {
+		return nil, err
+	}
+	for ev := range ch {
+		switch ev.Type {
+		case agentcore.StreamEventDone:
+			msg := ev.Message
+			if msg.StopReason == "" && ev.StopReason != "" {
+				msg.StopReason = ev.StopReason
+			}
+			return &agentcore.LLMResponse{Message: msg}, nil
+		case agentcore.StreamEventError:
+			if ev.Err != nil {
+				return nil, ev.Err
+			}
+			return nil, errors.New("stream closed with error event")
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+	return nil, errors.New("stream closed without done event")
+}
+
 // JSONSchemaOverride 返回当前选中模型的 config json_schema 三态声明。
 func (m *SwappableModel) JSONSchemaOverride() *bool {
 	return m.StructuredOutputFacts().JSONSchemaOverride
@@ -217,12 +270,15 @@ func (ms *ModelSet) Swap(role, provider, model string) error {
 	// 连通性冒烟：曾出现用户切到代理端拒绝站外调用的免费模型
 	// （OpenCode's free tier can only be used from within OpenCode [auth, HTTP 403]）
 	// 后 40 秒 arbiter 才挂。切换时发一个最小请求，失败则当场拦截、保留原模型。
+	// 冒烟经 SwappableModel 包装发起：其 Generate 流式优先，与切后真实调用
+	// （worker 流式、arbiter 经同一包装）同形态，避免冒烟用网关不服务的形态
+	// 误杀可用模型（非流式 403 而流式 200 的网关按形态路由已实测）。
 	smoke := ms.smokeTest
 	// 注意：Swap 调用时已持有写锁，直接读字段不另加锁。
 	if smoke == nil {
 		smoke = smokeTestModel
 	}
-	if err := smoke(next); err != nil {
+	if err := smoke(NewSwappableModel(provider, model, next, ms.config.ModelJSONSchema(provider, model))); err != nil {
 		return fmt.Errorf("模型 %s/%s 连通性检查失败（已保留原模型）: %w", provider, model, err)
 	}
 
@@ -383,16 +439,14 @@ func (ms *ModelSet) SetSmokeTestForTest(fn func(agentcore.ChatModel) error) {
 	ms.smokeTest = fn
 }
 
-// smokeTestModel 向新模型发一个最小非流式请求做连通性检查。超时 90s（单次
+// smokeTestModel 向新模型发一个最小请求做连通性检查。超时 90s（单次
 // Generate 无重试，403 类拒绝通常秒级返回）。失败则调用方保留原模型。
 //
-// 形状必须保持最小且不带 thinking：ainovel 经 litellm-go 的 openai provider
-// 出站（provider/openai/request.go），非推理模型遇到显式 thinking（含
-// ThinkingMax/ThinkingOff）在本地直接报错，请求发不出去——冒烟若带上
-// thinking，所有走 openai 协议的代理模型（CPA-* 等）会被稳定误杀。网关侧对
-// 上游免费池的路由差异无法经 Thinking API 复制，保持 thinking-free 的
-// Generate 才是冒烟的正确形状；真实调用的偶发 403/503 由 llmretry 与
-// failoverModel 承担，不在冒烟里解决。
+// 调用方须传入 SwappableModel 包装：其 Generate 流式优先，与切后真实调用
+// 同形态。形状必须保持最小且不带 thinking：openai 协议下非推理模型遇到显式
+// thinking（含 ThinkingMax/ThinkingOff）在 litellm-go 本地直接报错，请求发
+// 不出去——冒烟若带上 thinking，所有走 openai 协议的代理模型会被稳定误杀；
+// 真实调用的偶发 403/503 由 llmretry 与 failoverModel 承担，不在冒烟里解决。
 func smokeTestModel(model agentcore.ChatModel) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
